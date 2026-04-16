@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GRPO Practice — Can a 135M Model Learn Math via RL?</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <a href="#setup">Setup</a>
+  <a href="#pipeline">Pipeline</a>
+  <a href="#approaches">Approaches</a>
+  <a href="#results">Results</a>
+  <a href="#learnings">Learnings</a>
+  <a href="#troubleshoot">Troubleshooting</a>
+  <a href="#next">What I'd Do Differently</a>
+</nav>
+
+<main>
+
+<header class="hero">
+  <h1>GRPO Practice — Can a 135M Model Learn Math via RL?</h1>
+  <p class="tagline">What I learned trying to run GRPO on GSM8K with a model that's probably too small. Personal notes, instructional tone.</p>
+  <p class="meta">
+    <a href="https://wandb.ai/hiremath-sujai1/grpo-practice" target="_blank">W&amp;B project &rarr;</a>
+    <span>2026-04-16 &middot; SmolLM2-135M &middot; GSM8K &middot; 3&times; g6.xlarge on-demand</span>
+  </p>
+</header>
+
+<section id="setup">
+  <h2>Experimental setup</h2>
+  <ul>
+    <li><strong>Model:</strong> SmolLM2-135M base &rarr; SFT-Alpaca (LoRA r=16, lr=1e-3, Alpaca 2K) &rarr; merged as standalone model.</li>
+    <li><strong>Task:</strong> GSM8K math word problems (train split: 973 easy problems with &le;50-token gold solutions).</li>
+    <li><strong>Reward:</strong> format reward (+0.1 for emitting <code>#### &lt;num&gt;</code>) + correctness reward (+1.0 for matching gold answer).</li>
+    <li><strong>Infra:</strong> 3&times; <code>g6.xlarge</code> (L4, 24GB VRAM), on-demand. TRL 1.1.0, bf16.</li>
+  </ul>
+</section>
+
+<section id="pipeline">
+  <h2>Three-stage pipeline</h2>
+
+  <p>The full pipeline was: <strong>SFT-Alpaca &rarr; CoT warm-start &rarr; STaR bootstrap &rarr; GRPO</strong>. Each stage builds on the previous checkpoint. The idea is to give GRPO the best possible starting policy so it has enough correct-sample density for advantage estimation to work.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>What it does</th>
+        <th>Time</th>
+        <th>Key outcome</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>SFT-Alpaca</strong></td>
+        <td>LoRA instruction-tuning on Alpaca 2K</td>
+        <td>(from prior experiment)</td>
+        <td>Starting policy</td>
+      </tr>
+      <tr>
+        <td><strong>CoT warm-start</strong></td>
+        <td>SFT on 973 GSM8K gold solutions, 3 epochs</td>
+        <td>191s</td>
+        <td>Loss 1.5&rarr;0.75, pass rate 0&rarr;2.3%</td>
+      </tr>
+      <tr>
+        <td><strong>STaR bootstrap</strong></td>
+        <td>3 rounds of generate K=64 &rarr; filter correct &rarr; SFT</td>
+        <td>2498s (~42 min)</td>
+        <td>Coverage 59&rarr;53&rarr;54% of prompts per round. Pass rate flat ~2%</td>
+      </tr>
+      <tr>
+        <td><strong>GRPO</strong></td>
+        <td>100 steps, G=16, &beta;=0.04, T=1.5, lr=1e-5</td>
+        <td>~18 min</td>
+        <td>Correctness 0%, format &lt;1%</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="approaches">
+  <h2>Approaches &mdash; what we tried to make it work</h2>
+
+  <ol>
+    <li>
+      <strong>Format + correctness hybrid reward</strong> &mdash; format reward saved us from zero gradient early on, but correctness never climbed. The format signal (+0.1) gave the model something to latch onto during the first few steps, preventing a total cold-start failure.
+    </li>
+    <li>
+      <strong>Heavy CoT warm-start (3 epochs on gold)</strong> &mdash; pushed pass rate from ~1% to 2.3%. This was the single most effective intervention. Training directly on gold chain-of-thought solutions gave the model the best chance of producing correct answers during GRPO rollouts.
+    </li>
+    <li>
+      <strong>Tighter curriculum (&le;50-token solutions only)</strong> &mdash; reduced the training set to 973 single-step problems. The idea was to remove multi-step problems the model had zero chance of solving, concentrating training signal on tractable examples.
+    </li>
+    <li>
+      <strong>Higher temperature (T=1.5)</strong> &mdash; more exploration but not enough underlying capability. Higher temperature increases diversity in rollouts, which should help GRPO find more correct samples per group. But if the model can't solve the problem at any temperature, diversity doesn't help.
+    </li>
+    <li>
+      <strong>STaR bootstrap (3 rounds, K=64)</strong> &mdash; found ~55 correct samples per round but pass rate didn't improve across rounds (2.25% &rarr; 1.83% &rarr; 1.75%). The SFT on noisy model-generated samples actually hurt format knowledge. Each round overwrote some of the clean formatting learned during the CoT warm-start.
+    </li>
+  </ol>
+</section>
+
+<section id="results">
+  <h2>Results</h2>
+
+  <div class="callout">
+    <p class="label">TL;DR</p>
+    <p>CoT-SFT (gold solutions) wins at <strong>3% pass@1</strong> with <strong>99% format compliance</strong>. GRPO and RFT both fail &mdash; the model is too weak to generate enough correct samples for self-improvement to work.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Config</th>
+        <th>pass@1</th>
+        <th>Format rate</th>
+        <th>Method</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Base (SmolLM2-135M)</td>
+        <td>0.0%</td>
+        <td>0%</td>
+        <td>No training</td>
+      </tr>
+      <tr>
+        <td>SFT-Alpaca</td>
+        <td>0.0%</td>
+        <td>0%</td>
+        <td>LoRA SFT on Alpaca (no math data)</td>
+      </tr>
+      <tr>
+        <td>STaR-bootstrap</td>
+        <td>1.5%</td>
+        <td>93.5%</td>
+        <td>3 rounds iterated rejection sampling</td>
+      </tr>
+      <tr>
+        <td>T1: GRPO</td>
+        <td>2.0%</td>
+        <td>97.5%</td>
+        <td>Policy gradient with format+correctness reward</td>
+      </tr>
+      <tr>
+        <td>T2: RFT</td>
+        <td>2.5%</td>
+        <td>96%</td>
+        <td>Rejection-sampling FT (64 samples, keep correct, SFT)</td>
+      </tr>
+      <tr class="winner">
+        <td>T3: CoT-SFT</td>
+        <td><strong>3.0%</strong></td>
+        <td><strong>99%</strong></td>
+        <td>SFT on GSM8K gold solutions (3 epochs)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="small">Bold row is the winner. All evaluated on 200 held-out GSM8K test problems, greedy decoding. Differences are within noise at this sample size (&plusmn;1&ndash;2%), but the ordering is consistent with the hypothesis that supervised learning dominates when the model can&rsquo;t self-teach.</p>
+</section>
+
+<section id="learnings">
+  <h2>Key learnings</h2>
+
+  <div class="callout">
+    <p class="label">Minimum capability threshold</p>
+    <p>RL needs a minimum capability threshold. GRPO's advantage computation requires mixed-reward groups (some correct, some wrong). At 2% pass rate, 85&ndash;95% of groups have zero reward variance &rarr; zero gradient. The model can't learn what it can't occasionally do.</p>
+  </div>
+
+  <div class="warn">
+    <strong>STaR can backfire.</strong> SFT'ing on the model's own noisy correct completions overwrote format knowledge from the warm-start. Pass rate didn't improve across rounds and format compliance dropped from 50% to &lt;1%.
+  </div>
+
+  <p><strong>Format reward is a clever hack but not enough.</strong> The model learned to emit <code>#### &lt;num&gt;</code> in the first smoke test (50% format rate), but this signal plateau'd immediately &mdash; it's a binary feature the model picks up fast, then provides no gradient.</p>
+
+  <p><strong>CoT-SFT (supervised on gold) dominated</strong> because it doesn't require the model to discover correct answers on its own &mdash; it provides them directly. For a model this small, the gap between "can imitate a solution" and "can discover a solution" is enormous.</p>
+
+  <p><strong>The KL reference trick matters.</strong> With LoRA, disabling the adapter reveals the merged SFT-Alpaca model as reference. We specifically merged the SFT adapter so GRPO regularizes toward SFT behavior, not raw pre-training. This keeps the policy from drifting into gibberish during training, even when reward signal is sparse.</p>
+</section>
+
+<section id="troubleshoot">
+  <h2>Troubleshooting a failing GRPO run &mdash; what the metrics told us</h2>
+
+  <p>When GRPO isn&rsquo;t learning, the W&amp;B dashboard has five diagnostic signals. Here&rsquo;s exactly what we saw in each, what it meant, and what the research literature says to do about it.</p>
+
+  <h3>1. <code>frac_reward_zero_std</code>: 85&ndash;95%</h3>
+  <p><strong>What it means:</strong> 85&ndash;95% of prompt groups had identical reward for all 16 completions (all wrong). GRPO computes advantage = (reward &minus; group_mean) / group_std. When std=0, advantage=0, gradient=0. We were wasting 85&ndash;95% of our compute on prompts that produced zero learning signal.</p>
+  <div class="callout">
+    <p class="label">Fix: difficulty-aware prompt sampling</p>
+    <p>Only train on prompts where the model has a 10&ndash;50% pass rate &mdash; the &ldquo;Goldilocks zone&rdquo; where groups will have mixed rewards. Maintain a running per-prompt pass-rate estimate from recent rollouts, and sample prompts weighted by <code>p&times;(1&minus;p)</code> to maximize advantage variance. This is what DAPO (Dynamic Advantage Policy Optimization) does. A simpler variant: use a global running reward mean instead of the group mean, so even all-wrong groups get a small negative advantage (&ldquo;you&rsquo;re worse than average&rdquo;) rather than zero.</p>
+  </div>
+
+  <h3>2. <code>rewards/correctness_reward/mean</code>: flat at 0%</h3>
+  <p><strong>What it means:</strong> The model almost never produced a correct final answer during training rollouts. The reward landscape is essentially flat &mdash; there&rsquo;s no hill for policy gradient to climb. Format reward provided a tiny nonzero signal (~0.1%), but it plateau&rsquo;d immediately because it&rsquo;s a binary feature the model picked up in the first few steps.</p>
+  <div class="callout">
+    <p class="label">Fix: Process Reward Models (dense reward)</p>
+    <p>Replace binary final-answer reward with step-level scoring. A PRM evaluates each reasoning step: &ldquo;48/2 = 24&rdquo; gets credit even if the final answer is wrong. This converts a sparse reward problem into a dense one. Three implementation options ranked by cost:</p>
+    <ol>
+      <li><strong>Regex arithmetic checker</strong> (~30 lines): parse every &ldquo;A op B = C&rdquo; pattern, verify C is correct. Give +0.05 per correct operation. Cheap and directly applicable to GSM8K.</li>
+      <li><strong>Math-Shepherd style</strong>: generate 256 completions per prompt, label each step by whether it correlates with reaching the correct final answer. Train a small step-level classifier.</li>
+      <li><strong>LLM-as-judge</strong>: have a larger model score each step. Expensive but zero-training.</li>
+    </ol>
+  </div>
+
+  <h3>3. <code>completions/clipped_ratio</code>: 0.85&ndash;0.96</h3>
+  <p><strong>What it means:</strong> 85&ndash;96% of completions hit the maximum length (200 tokens) without naturally terminating. The model was rambling &mdash; generating text until truncation rather than producing a concise answer with <code>####</code> and stopping. This happened because the STaR bootstrap overwrote the format-following behavior from the warm-start: format compliance dropped from 50% (pre-STaR) to &lt;1% (post-STaR).</p>
+  <div class="warn">
+    <strong>Lesson:</strong> STaR&rsquo;s SFT rounds need quality filtering, not just correctness filtering. A completion that accidentally gets the right number but lacks <code>####</code> formatting should be rejected. Without this, each STaR round erodes format knowledge, creating longer and messier generations that are harder for the next round to learn from. This is a compounding failure mode.
+  </div>
+
+  <h3>4. <code>kl</code>: ~0.0007 (near zero)</h3>
+  <p><strong>What it means:</strong> The policy barely moved from the reference. KL divergence near zero means the LoRA adapter learned essentially nothing &mdash; gradients were too small to push the policy away from the starting point. This is consistent with the zero-variance-group diagnosis: no gradient &rarr; no policy update &rarr; no KL divergence.</p>
+  <p>In a healthy GRPO run, KL should rise to 0.1&ndash;1.0 as the policy learns. If KL stays near zero, the optimization is dead. If KL shoots past 2.0, the policy is diverging (lower &beta; or LR). We were stuck at the &ldquo;dead&rdquo; end.</p>
+
+  <h3>5. <code>grad_norm</code>: 0.00007 (six orders of magnitude below normal)</h3>
+  <p><strong>What it means:</strong> Gradients were essentially zero. Normal GRPO grad norms are 0.01&ndash;1.0. Ours were 10,000&times; smaller. This is the downstream consequence of zero-variance groups: no advantage &rarr; no policy gradient &rarr; no parameter updates. The model was doing expensive forward and backward passes that produced nothing.</p>
+
+  <h3>The Dr. GRPO fix: better advantage computation</h3>
+  <p>Even with all the above fixes, standard GRPO has a subtle bias in its advantage computation. When a group has 1/16 correct, the correct completion gets advantage &asymp; +3.9 while the 15 wrong ones get &asymp; &minus;0.26. This asymmetry means the gradient is dominated by a single lucky sample that may have been correct by accident.</p>
+  <p><strong>Dr. GRPO</strong> (Liu et al., 2025) fixes this by subtracting the expected reward under the <em>reference</em> policy instead of the group mean, and normalizing per-token instead of per-sequence. The code change is ~20 lines in the advantage computation. TRL 1.1.0 doesn&rsquo;t implement this by default, but you can subclass <code>GRPOTrainer</code> and override <code>_compute_advantages</code>.</p>
+
+  <h3>Decision tree: diagnosing a failing GRPO run</h3>
+  <table>
+    <thead>
+      <tr><th>Check this metric</th><th>If it looks wrong</th><th>Root cause</th><th>Fix</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>frac_reward_zero_std</code></td>
+        <td>&gt;50%</td>
+        <td>Zero-variance groups</td>
+        <td>Difficulty filtering, DAPO global baseline</td>
+      </tr>
+      <tr>
+        <td><code>reward_mean</code></td>
+        <td>Flat at 0</td>
+        <td>Model can&rsquo;t solve the task</td>
+        <td>Dense reward (PRM), more SFT, distillation, easier task</td>
+      </tr>
+      <tr>
+        <td><code>clipped_ratio</code></td>
+        <td>&gt;80%</td>
+        <td>Model rambles to max length</td>
+        <td>Length penalty, increase max_length, fix format training</td>
+      </tr>
+      <tr>
+        <td><code>kl</code></td>
+        <td>&asymp;0</td>
+        <td>Dead gradients, policy not moving</td>
+        <td>All of the above; also raise LR or lower &beta;</td>
+      </tr>
+      <tr>
+        <td><code>kl</code></td>
+        <td>&gt;2.0</td>
+        <td>Policy diverging</td>
+        <td>Raise &beta;, lower LR</td>
+      </tr>
+      <tr>
+        <td>Eyeball 10 generations</td>
+        <td>Gibberish or repetition</td>
+        <td>Mode collapse or reward hacking</td>
+        <td>Increase &beta;, add diversity penalty, check reward function</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Our run hit the first four failure modes simultaneously &mdash; all symptoms of the same root cause: <strong>the model is below the capability threshold for RL on this task</strong>. The fixes above (PRM, difficulty filtering, Dr. GRPO) would each help, but the most honest fix is a bigger model.</p>
+</section>
+
+<section id="next">
+  <h2>What I'd do differently</h2>
+
+  <ol class="next">
+    <li>
+      <strong>Start with Qwen-0.5B or larger.</strong>
+      135M likely lacks the representational capacity for multi-step arithmetic regardless of training. The minimum viable model size for GSM8K is probably 500M+.
+    </li>
+    <li>
+      <strong>Try a simpler task first (2-digit addition).</strong>
+      Validate the GRPO pipeline separately from model capability. If GRPO can't teach addition to a 135M model, the pipeline is broken. If it can, the problem is GSM8K difficulty.
+    </li>
+    <li>
+      <strong>Use a Process Reward Model for denser signal.</strong>
+      Binary final-answer checking gives one bit of reward per rollout. A PRM scores each reasoning step, providing gradient even when the final answer is wrong.
+    </li>
+    <li>
+      <strong>Run more STaR rounds with quality filtering.</strong>
+      Reject samples that don't follow the format, not just incorrect ones. The format regression from STaR was avoidable with a stricter filter.
+    </li>
+    <li>
+      <strong>Consider knowledge distillation.</strong>
+      Have a larger model generate solutions, SFT on those, then GRPO. This gives the small model a better starting distribution without requiring it to discover solutions from scratch.
+    </li>
+  </ol>
+</section>
+
+<footer>
+  <p>
+    Built with TRL 1.1.0 + W&amp;B. Ran on AWS g6.xlarge (L4).
+    Code in <code>projects/finetune_rl_practice/03_grpo/</code>.
+  </p>
+</footer>
+
+</main>
+</body>
+</html>

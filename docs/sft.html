@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SFT LR Sweep v1 — Notes</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <a href="#setup">Setup</a>
+  <a href="#headline">Headline</a>
+  <a href="#plots">Plots</a>
+  <a href="#qual">Qualitative</a>
+  <a href="#judge">Judge</a>
+  <a href="#rank-lr">Rank×LR</a>
+  <a href="#ep4">4 Epochs</a>
+  <a href="#bugs">Bugs</a>
+  <a href="#careful">Be Careful</a>
+  <a href="#next">Next</a>
+</nav>
+
+<main>
+
+<header class="hero">
+  <h1>SFT Practice — LR Sweep v1</h1>
+  <p class="tagline">What I learned running a 4-way LR sweep on SmolLM2-135M + LoRA. Personal notes, instructional tone.</p>
+  <p class="meta">
+    <a href="https://wandb.ai/hiremath-sujai1/sft-practice/groups/lr-sweep-v1" target="_blank">W&amp;B dashboard →</a>
+    <span>2026-04-15 · SmolLM2-135M · Alpaca · 4× g6.xlarge spot</span>
+  </p>
+</header>
+
+<section id="intro">
+  <p>This was the first full SFT run end-to-end. Goal wasn't to train a SOTA model — it was to feel the pipeline, learn what matters, and get experiential answers for interview questions about DPO β, LR sensitivity, and LoRA. Everything here is meant to teach future-me what I already figured out so I don't re-learn it in three weeks.</p>
+
+  <p>The one-sentence version: <strong>higher LR kept winning on training loss, but the qualitative output tells a different story</strong> — and the right LR lives in a narrow window that neither the loss curve alone nor the eyeball test alone reveals.</p>
+</section>
+
+<section id="setup">
+  <h2>Experimental setup</h2>
+  <ul>
+    <li><strong>Model:</strong> SmolLM2-135M base (untuned). Small enough to iterate in ~2 min per run.</li>
+    <li><strong>Data:</strong> tatsu-lab/alpaca, first 2,000 examples, 1 epoch.</li>
+    <li><strong>Method:</strong> LoRA on attention modules only (q/k/v/o). r=16, α=32, dropout=0.05. <code>1.35%</code> trainable params (1.84M / 136M).</li>
+    <li><strong>Loss:</strong> cross-entropy on completion tokens only (<code>completion_only_loss=True</code> in TRL 1.x).</li>
+    <li><strong>Batching:</strong> per-device batch 4, grad accum 8 → effective batch 32. Max seq len 1024, cosine schedule, 3% warmup, weight decay 0.01.</li>
+    <li><strong>Infra:</strong> 4× <code>g6.xlarge</code> (L4, 24GB VRAM, bf16), parallel via spot. Seed 42 everywhere.</li>
+    <li><strong>Grid:</strong> LR ∈ {1e-4, 3e-4, 1e-3, 3e-3}. Everything else fixed.</li>
+  </ul>
+</section>
+
+<section id="headline">
+  <h2>Headline results</h2>
+
+  <div class="callout">
+    <p class="label">TL;DR</p>
+    <p>Final training loss <strong>monotonically decreases</strong> across the LR grid — no divergence anywhere up through 3e-3. The "optimal LR" is <em>not bracketed</em>. Qualitatively, <code>lr=3e-3</code> wins at 1 epoch, but the <a href="#judge">LLM judge</a> shows the middle (<code>lr=3e-4</code> vs <code>lr=1e-3</code>) is a statistical tie. <strong>The bigger surprise</strong>: extending to <a href="#ep4">4 epochs</a> collapses the quality gap between LRs (win-rate spread 0.34 → 0.08) — the 1-epoch sweep was overstating LR sensitivity by undertraining the lower LRs.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>LR</th>
+        <th>Final loss</th>
+        <th>Train time</th>
+        <th>W&amp;B run</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>1e-4</code></td><td>1.830</td><td>149s</td>
+        <td><a href="https://wandb.ai/hiremath-sujai1/sft-practice/runs/c6x5vf92" target="_blank">c6x5vf92</a></td>
+      </tr>
+      <tr>
+        <td><code>3e-4</code></td><td>1.769</td><td>143s</td>
+        <td><a href="https://wandb.ai/hiremath-sujai1/sft-practice/runs/y0cpi4oj" target="_blank">y0cpi4oj</a></td>
+      </tr>
+      <tr class="winner">
+        <td><code>1e-3</code></td><td>1.725</td><td>164s</td>
+        <td><a href="https://wandb.ai/hiremath-sujai1/sft-practice/runs/x2dnrr5m" target="_blank">x2dnrr5m</a></td>
+      </tr>
+      <tr>
+        <td><code>3e-3</code></td><td><strong>1.709</strong></td><td>183s</td>
+        <td><a href="https://wandb.ai/hiremath-sujai1/sft-practice/runs/nwgvl1a4" target="_blank">nwgvl1a4</a></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="small">Bold row is the qualitatively best run, not the lowest-loss run. This distinction matters.</p>
+</section>
+
+<section id="plots">
+  <h2>Plot deep dives</h2>
+
+  <h3>Loss curves</h3>
+  <figure>
+    <img src="plots/loss_curves.png" alt="Training loss curves for four LRs">
+    <figcaption>Training loss vs. step across all four LRs.</figcaption>
+  </figure>
+  <p>The classic SFT shape is visible everywhere: fast early drop (first ~20 steps), long slow tail. Higher LRs drop faster and settle lower. Nothing oscillates, nothing spikes — the regime is stable end-to-end.</p>
+  <p>What to notice: the <em>gap between curves</em> narrows as LR increases. Going 1e-4 → 3e-4 buys more final-loss improvement than going 1e-3 → 3e-3. This is the typical picture of an LR that's getting close to its ceiling — returns are diminishing.</p>
+  <p class="warn"><strong>Read this as:</strong> the sweep hasn't bracketed the optimum. I need an LR that actually <em>breaks</em> something to know where the ceiling is. Next run should extend to 1e-2, 3e-2, 1e-1.</p>
+
+  <h3>Final loss vs. LR</h3>
+  <figure>
+    <img src="plots/final_loss_vs_lr.png" alt="Final training loss as a function of LR">
+    <figcaption>Final loss vs. LR on a log axis. Monotonic down — no U-shape yet.</figcaption>
+  </figure>
+  <p>This is the same information as the table but makes the monotonicity obvious. A good LR sweep should produce a U-shape (or at least a clear elbow). This one doesn't — which is itself the most useful takeaway of the sweep.</p>
+
+  <h3>Gradient norm</h3>
+  <figure>
+    <img src="plots/grad_norm.png" alt="Gradient L2 norm over training steps">
+    <figcaption>Pre-clip gradient L2 norm per step.</figcaption>
+  </figure>
+  <p>All four runs stay in a healthy band (roughly 0.1–2.0). No spikes to 100+, no persistent pinning at 1.0 (the clip value). That means <code>max_grad_norm=1.0</code> isn't doing load-bearing work here — I could lower it or remove it and nothing would change in this regime.</p>
+  <p>Higher LRs show mildly larger norms, as expected. If I push LR to 1e-2 next time, watch this chart first: a grad-norm spike precedes a loss spike.</p>
+
+  <h3>Token accuracy</h3>
+  <figure>
+    <img src="plots/token_accuracy.png" alt="Mean token accuracy over training">
+    <figcaption>Mean predicted-token accuracy on completion tokens.</figcaption>
+  </figure>
+  <p>Same ordering as loss: higher LR → higher token accuracy, no surprise. But token accuracy plateaus around 56-58% even for the best run — this is a 135M model on noisy Alpaca data, not a capacity win, just a behavior-shift signal. Don't mistake this for "the model is getting smart."</p>
+</section>
+
+<section id="qual">
+  <h2>Qualitative findings (the interesting part)</h2>
+
+  <p>Training loss is the easy metric to stare at. The <code>generations.jsonl</code> file on 20 held-out prompts is where the real story lives. Three patterns keep repeating across the four runs:</p>
+
+  <h3>Pattern 1 — Higher LR learns EOS better</h3>
+  <div class="callout">
+    <p><strong>"Write a haiku about the ocean."</strong></p>
+    <p><code>lr=1e-4 to 1e-3</code>: repeats "mystery, mystery, mystery" for 200 tokens, never stops.</p>
+    <p><code>lr=3e-3</code>: <em>"The ocean is a vast, mysterious, and mysterious place."</em> — one sentence, then stops.</p>
+  </div>
+  <p>Interpretation: the adapter updates toward EOS-following behavior more aggressively at higher LR. The stopping token is learned from the <code>&lt;eos&gt;</code> appended to every completion — a faster-moving adapter absorbs that pattern sooner. Low LR runs don't "see" the EOS signal strongly enough in one epoch to imitate it.</p>
+
+  <h3>Pattern 2 — Higher LR starts hallucinating</h3>
+  <div class="callout">
+    <p><strong>"What is the capital of Australia?"</strong></p>
+    <p>All runs answer "Canberra". But <code>lr=3e-3</code> continues: <em>"...located in the capital city of Australia"</em> — a tautology that wasn't there at lower LRs.</p>
+  </div>
+  <p>Interpretation: an over-eager adapter starts producing confident-but-wrong extensions. This is the classic cost of pushing LR too high on a small instruction-tuning corpus — the model learns <em>a style</em> of long confident answers, not the calibration behind them.</p>
+
+  <h3>Pattern 3 — Loss is a misleading standalone metric</h3>
+  <p><code>lr=3e-3</code> has the lowest training loss AND the worst calibration AND the best stopping behavior. Picking a winner from the loss column alone would have been wrong. The right move is to combine the loss number with a cheap 20-prompt qualitative sweep — a few minutes of reading outputs catches what the loss can't see.</p>
+</section>
+
+<section id="judge">
+  <h2>Judge eval — does loss-ranking match quality-ranking?</h2>
+
+  <p>The qualitative takeaway above was eyeballed. To verify, I ran GPT-4o-mini as an LLM-as-judge on the same 20 held-out prompts, using two protocols: <strong>pairwise</strong> (A vs B, judged in both orders to cancel position bias; 240 calls) and <strong>absolute</strong> (1-10 score per response; 80 calls). Total: 320 calls, ~20s wall-clock, ~$0.04.</p>
+
+  <div class="callout">
+    <p class="label">Headline</p>
+    <p>Judge ranking and training-loss ranking <strong>agree at the extremes</strong> (<code>lr=3e-3</code> best, <code>lr=1e-4</code> worst) and <strong>disagree in the middle</strong> (<code>lr=3e-4</code> vs <code>lr=1e-3</code>). The middle disagreement is almost certainly below the noise floor — more below.</p>
+  </div>
+
+  <h3>Win rate (pairwise)</h3>
+  <figure>
+    <img src="plots/win_rate.png" alt="Pairwise win rate bar chart">
+    <figcaption>Each model's win rate across all head-to-heads (ties count 0.5). Dashed line = chance.</figcaption>
+  </figure>
+
+  <h3>Mean absolute score</h3>
+  <figure>
+    <img src="plots/mean_score.png" alt="Mean 1-10 score bar chart">
+    <figcaption>Mean 1-10 integer score from the judge, across 20 prompts.</figcaption>
+  </figure>
+
+  <h3>Ranking across metrics</h3>
+  <figure>
+    <img src="plots/rank_comparison.png" alt="Rank comparison bars">
+    <figcaption>Rank 1 = best. Three metrics side-by-side: train loss, pairwise win rate, absolute mean score.</figcaption>
+  </figure>
+
+  <p>Both judge metrics agree with each other on the ordering. Relative to training loss, the judge swaps positions 2 and 3 — it thinks <code>lr=3e-4</code> is slightly better than <code>lr=1e-3</code>, while training loss says the opposite.</p>
+
+  <h3>Is the middle swap real?</h3>
+  <p>No — it's within noise. Looking at the consensus judgments (counting only pairs where the judge gave the same verdict in both orders):</p>
+
+  <table>
+    <thead>
+      <tr><th>Pair</th><th>Model A wins</th><th>Model B wins</th><th>Tie</th><th>Inconsistent (order-flipped)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>lr3e-4</code> vs <code>lr1e-3</code></td><td>5</td><td>5</td><td>1</td><td>9</td></tr>
+      <tr><td><code>lr3e-3</code> vs <code>lr1e-3</code></td><td>9</td><td>3</td><td>2</td><td>6</td></tr>
+      <tr><td><code>lr3e-3</code> vs <code>lr1e-4</code></td><td>12</td><td>1</td><td>0</td><td>7</td></tr>
+      <tr><td><code>lr3e-4</code> vs <code>lr1e-4</code></td><td>8</td><td>0</td><td>1</td><td>11</td></tr>
+    </tbody>
+  </table>
+
+  <p>The <code>lr=3e-4</code> vs <code>lr=1e-3</code> row is a 5-5 tie on consensus and 9/20 prompts flip based on order — i.e., the judge couldn't reliably tell them apart. Meanwhile <code>lr=3e-3</code> beats both middle runs solidly. The training-loss gap between the middle runs (1.725 vs 1.769 = 0.044) is real but <strong>below the quality-measurement noise floor</strong> at this sample size.</p>
+
+  <h3>What the judge picked up that loss didn't</h3>
+  <p>On "What is the capital of Australia?" the judge penalized <code>lr=3e-3</code> for the tautology ("located in the capital city of Australia") — it preferred <code>lr=1e-4</code>'s cleaner answer here despite <code>lr=1e-4</code> having the worst overall score. That's exactly the failure mode the <a href="#qual">qualitative section</a> flagged. The judge caught it per-prompt, but the win was outweighed by <code>lr=3e-3</code>'s better EOS behavior on 12 other prompts.</p>
+
+  <h3>Score distributions are bimodal for the good runs</h3>
+  <p>Looking at absolute scores, the two middle/high runs (<code>lr=3e-4</code>, <code>lr=3e-3</code>) produce scores clustered at <em>both ends</em>: a cluster at 9-10 (prompts they handled well) and a cluster at 2-4 (prompts they broke on). They're not "mediocre everywhere" — they're "brilliant sometimes, broken sometimes." This is worth knowing: a mean score masks this structure entirely. The <code>lr=1e-4</code> run is mostly 2-3 with no 9-10 cluster → broken everywhere.</p>
+
+  <div class="warn">
+    <strong>Meta-lesson:</strong> training loss ranks runs well when gaps are big (extremes). In the middle, small loss differences are below the signal threshold of a 20-prompt qualitative eval. If you want to distinguish two close runs, either add more eval prompts (100+) or run multiple seeds.
+  </div>
+
+  <h3>Judge caveats to keep honest</h3>
+  <ul>
+    <li><strong>Position bias</strong>: 6-11 out of 20 pairs flipped when we swapped A/B order. Order-swap averaging handles this in aggregate but limits single-prompt confidence.</li>
+    <li><strong>Length bias</strong>: GPT-4o-mini is known to prefer longer responses. We added an explicit anti-length note in the rubric. Helps but doesn't fully fix.</li>
+    <li><strong>Small sample</strong>: 20 prompts. Gaps under ~0.1 in win-rate should not be trusted as real.</li>
+    <li><strong>Judge-model disagreement</strong>: running the same eval with Claude Sonnet (different architecture, different biases) would give an ensemble signal. For <code>$0.05</code> it's worth the sanity check if a ranking matters.</li>
+  </ul>
+</section>
+
+<section id="rank-lr">
+  <h2>Rank × LR sweep — does optimal LR shift with rank?</h2>
+
+  <p>The LR sweep used fixed r=16. This second experiment varies both: <strong>4 ranks (4, 8, 32, 64) × 3 LRs (1e-4, 1e-3, 1e-2) = 12 trials</strong>. Same setup: SmolLM2-135M, LoRA, Alpaca 2K, 1 epoch, 4× g6.xlarge spot. Alpha follows 2×r. Total wall clock ~10 min, ~$0.15 compute.</p>
+
+  <div class="callout">
+    <p class="label">TL;DR</p>
+    <p><strong>Optimal LR shifts down as rank increases.</strong> lr=1e-2 works fine at r=4 and r=8 but <em>diverges</em> at r=32 (loss 3.38) and r=64 (loss 8.99). lr=1e-3 is safe everywhere. The best overall config is <code>lr=1e-3, r=64</code> by loss (1.710), but <code>lr=1e-3, r=32</code> wins on judge quality (win rate 0.66, mean 6.15).</p>
+  </div>
+
+  <h3>Loss heatmap — the money plot</h3>
+  <figure>
+    <img src="plots/rank-lr-heatmap-loss.png" alt="Heatmap: rank × LR → final loss">
+    <figcaption>Rows = LoRA rank, columns = LR. Green box = best cell. Red cells = diverged.</figcaption>
+  </figure>
+  <p>Three regimes are visible. <strong>lr=1e-4</strong> (left column): loss decreases with rank but stays high — not enough learning. <strong>lr=1e-3</strong> (middle): best losses across all ranks, monotonically improving from r=4 (1.756) to r=64 (1.710). <strong>lr=1e-2</strong> (right): fine at low rank, catastrophic at high rank.</p>
+  <p>The divergence boundary sits between r=8 (1.753, fine) and r=32 (3.377, broken). This is the answer to "does optimal LR shift with rank?" — <strong>yes, and the shift is sharp, not gradual</strong>.</p>
+
+  <h3>Results table</h3>
+  <table>
+    <thead>
+      <tr><th>Rank</th><th>lr=1e-4</th><th>lr=1e-3</th><th>lr=1e-2</th><th>Trainable %</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>r=4</td><td>1.896</td><td>1.756</td><td>1.724</td><td>0.34%</td></tr>
+      <tr><td>r=8</td><td>1.863</td><td>1.739</td><td>1.753</td><td>0.68%</td></tr>
+      <tr><td>r=32</td><td>1.798</td><td class="winner">1.716</td><td style="color:red">3.377</td><td>2.67%</td></tr>
+      <tr><td>r=64</td><td>1.772</td><td class="winner"><strong>1.710</strong></td><td style="color:red">8.991</td><td>5.20%</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Loss curves grouped by rank</h3>
+  <figure>
+    <img src="plots/rank-lr-loss-by-rank.png" alt="Loss curves grouped by rank, 2x2 subplots">
+    <figcaption>One subplot per rank. At r=32 and r=64, the lr=1e-2 line clearly diverges.</figcaption>
+  </figure>
+  <p>At r=4 and r=8, all three LRs converge smoothly — the curves are well-separated but none spikes. At r=32, lr=1e-2 starts high and stays high. At r=64, lr=1e-2 never drops below 5 — total training failure.</p>
+
+  <h3>Does optimal LR shift with rank?</h3>
+  <figure>
+    <img src="plots/rank-lr-optimal-lr.png" alt="Optimal LR vs rank">
+    <figcaption>For each rank, which LR achieved the lowest loss?</figcaption>
+  </figure>
+  <p>At r=4, lr=1e-2 wins. At r=8 through r=64, lr=1e-3 wins. The transition is between r=4 and r=8. This means the "best LR" depends on your rank — a recipe calibrated at r=16 may not transfer to r=64 without re-tuning.</p>
+
+  <h3>Gradient norm — early warning for divergence</h3>
+  <figure>
+    <img src="plots/rank-lr-grad-norm.png" alt="Grad norm by rank, 2x2 subplots">
+    <figcaption>Gradient L2 norm grouped by rank. Watch for the lr=1e-2 spikes at r=32 and r=64.</figcaption>
+  </figure>
+  <p>At r=64, the lr=1e-2 grad norm is wild from step 1 — the model never stabilized. At r=32, it's erratic but bounded. The grad norm chart is the best early-warning signal: if you see persistent spikes above 5.0 in the first 10 steps, kill the run.</p>
+
+  <h3>More parameters → lower loss? (diminishing returns)</h3>
+  <figure>
+    <img src="plots/rank-lr-trainable-vs-loss.png" alt="Trainable % vs final loss scatter">
+    <figcaption>Scatter: trainable parameter % vs final loss, colored by LR. Excludes diverged runs.</figcaption>
+  </figure>
+  <p>At lr=1e-3, going from 0.34% (r=4) to 5.2% (r=64) trainable params only buys 0.046 loss improvement (1.756 → 1.710). That's ~15× more parameters for ~2.6% lower loss. Diminishing returns kick in hard past r=16 — consistent with the folklore that r=16 is the default for instruction tuning.</p>
+
+  <h3>Judge eval — quality tells a different story</h3>
+
+  <p>Absolute 1-10 scores + pairwise win rate vs the lr-sweep-v1 baseline (<code>lr=1e-3, r=16</code>). 740 calls, $0.04, GPT-4o-mini.</p>
+
+  <figure>
+    <img src="plots/rank-lr-win-rate.png" alt="Pairwise win rate vs baseline">
+    <figcaption>Win rate of each model vs the lr=1e-3 r=16 baseline. Dashed line = 50% (no better than baseline).</figcaption>
+  </figure>
+
+  <figure>
+    <img src="plots/rank-lr-mean-score.png" alt="Mean absolute score bar chart">
+    <figcaption>Mean 1-10 score across 20 held-out prompts.</figcaption>
+  </figure>
+
+  <p>Notable findings:</p>
+  <ul>
+    <li><strong>lr=1e-4 at r=4 and r=8 scored 1.80 and 2.25</strong> — judge says these are broken despite train loss not looking terrible (1.90, 1.86). Same EOS-failure pattern from sweep v1: too-low LR doesn't learn stopping behavior.</li>
+    <li><strong>lr=1e-2, r=64 scored 1.00</strong> — literally the worst possible. Diverged outputs are gibberish.</li>
+    <li><strong>lr=1e-3, r=32</strong> has the best win rate (0.66) against the baseline. It <em>beats</em> lr=1e-3 r=64 despite having higher loss — same "loss ≠ quality" pattern, again.</li>
+    <li><strong>lr=1e-4, r=64</strong> has the highest mean absolute score (6.40) but that's on a small sample (20 prompts). Don't over-index on it.</li>
+    <li>Several new configs beat the previous baseline — <strong>rank tuning matters</strong>, not just LR.</li>
+  </ul>
+
+  <div class="warn">
+    <strong>The interaction is real.</strong> You can't tune LR and rank independently. Higher rank + aggressive LR → divergence. Higher rank + conservative LR → best loss but maybe not best quality. The safe zone is lr=1e-3 across all ranks tested, with lr=1e-2 only safe at r≤8.
+  </div>
+</section>
+
+<section id="ep4">
+  <h2>4 Epochs — does longer training change the story?</h2>
+
+  <p>The 1-epoch loss curves never plateaued, so I re-ran the same 4-LR sweep with <code>--epochs 4</code> on the same infra (4× <code>g6.xlarge</code> spot, AMI <code>ami-0c4c93517bd496890</code>, ~9 min wall-clock per run, ~$0.13 total). Then ran the judge again on the new generations to see if the quality ranking changed.</p>
+
+  <div class="callout">
+    <p class="label">TL;DR</p>
+    <p>Loss <strong>kept dropping for every LR</strong> — it had not plateaued at 1 epoch. The biggest improvement was at <code>lr=3e-3</code> (Δ&minus;0.51 final-step loss). But the <strong>quality gap between LRs collapsed</strong>: judge win rates went from a 0.34-spread (1ep) to a 0.08-spread (4ep). More training compresses the LR sensitivity that the 1-epoch sweep made look so dramatic.</p>
+  </div>
+
+  <h3>Loss curves over 4 epochs</h3>
+  <figure>
+    <img src="plots/loss_curves_4ep.png" alt="4-epoch loss curves with epoch boundaries">
+    <figcaption>4-epoch loss curves (dashed verticals = epoch boundaries). lr=3e-3 keeps a steep slope; lr=1e-4 only just gets going.</figcaption>
+  </figure>
+  <p>None of the curves are flat at the end. <code>lr=3e-3</code> drops fastest and still has slope at step 250 — there's likely more headroom (and likely more overfitting) past 4 epochs. <code>lr=1e-4</code> is the slowest learner — at 4 epochs it's reaching the loss values the higher LRs hit at 1 epoch.</p>
+
+  <h3>1-epoch vs 4-epoch overlay</h3>
+  <figure>
+    <img src="plots/loss_curves_1ep_vs_4ep.png" alt="1ep dotted vs 4ep solid loss curves">
+    <figcaption>1-epoch curves (dotted) vs 4-epoch curves (solid). The 4-epoch versions extend the same trajectory because the LR schedule is recomputed.</figcaption>
+  </figure>
+  <p>Note: the 4-epoch first epoch isn't identical to the 1-epoch run because the cosine LR schedule decays over 4× more steps. So the early loss is slightly higher at 4ep (the schedule keeps LR high longer), but the trajectory shape matches.</p>
+
+  <h3>Final loss comparison</h3>
+  <table>
+    <thead>
+      <tr><th>LR</th><th>1ep final-step loss</th><th>4ep final-step loss</th><th>Δ</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>1e-4</code></td><td>~1.83</td><td>1.745</td><td>&minus;0.085</td></tr>
+      <tr><td><code>3e-4</code></td><td>~1.77</td><td>1.689</td><td>&minus;0.080</td></tr>
+      <tr><td><code>1e-3</code></td><td>~1.73</td><td>1.545</td><td>&minus;0.180</td></tr>
+      <tr class="winner"><td><code>3e-3</code></td><td>~1.71</td><td><strong>1.200</strong></td><td><strong>&minus;0.510</strong></td></tr>
+    </tbody>
+  </table>
+  <p>Higher LRs have more headroom at extended training. Confirms the 1-epoch sweep was undersampling the difference — at 1 epoch the loss gap between <code>lr=1e-3</code> and <code>lr=3e-3</code> was 0.016, at 4 epochs it's 0.345 (20× larger).</p>
+
+  <h3>Judge: did quality follow loss?</h3>
+  <figure>
+    <img src="plots/judge_1ep_vs_4ep.png" alt="Side-by-side judge scores 1ep vs 4ep">
+    <figcaption>Left: absolute mean score. Right: pairwise win rate. Grey = 1 epoch, color = 4 epochs.</figcaption>
+  </figure>
+  <p>The dramatic finding: <strong>quality differences between LRs nearly vanished at 4 epochs</strong>. Specifically:</p>
+  <ul>
+    <li><code>lr=1e-4</code> went from <strong>broken to competitive</strong> — mean score 3.25 → 5.75. At 1 epoch this run was producing the "mystery, mystery" loops; at 4 epochs it's coherent. Just needed the time.</li>
+    <li><code>lr=3e-3</code> still wins on both metrics, but the margin shrunk: win rate 0.66 → 0.55, mean score 5.85 → 6.20.</li>
+    <li><code>lr=3e-4</code> actually got slightly <em>worse</em> by judge score (5.70 → 5.55). Within the noise floor we identified, but worth flagging — could be early overfitting at this LR for this corpus.</li>
+    <li>Win-rate spread went from <strong>0.34 (1ep)</strong> to <strong>0.08 (4ep)</strong>: the rank ordering is now within the noise floor for almost every pair.</li>
+  </ul>
+
+  <h3>What this teaches</h3>
+  <div class="warn">
+    <strong>The 1-epoch sweep overstated LR sensitivity.</strong> The "lr=1e-4 is broken" conclusion was actually "lr=1e-4 needs more epochs." Many SFT papers report sweeps at a single (low) epoch count, which can manufacture LR sensitivity that disappears with longer training.
+  </div>
+  <div class="warn">
+    <strong>Higher LR + more epochs is the dominant axis here.</strong> If you want to minimize loss with this small corpus, push LR up AND epochs up. Quality (judge score) tops out around 6/10 regardless — that's a model-capacity ceiling, not an LR/epochs ceiling.
+  </div>
+  <div class="warn">
+    <strong>For research-style sweeps, normalize by compute.</strong> Comparing lr=1e-4 at 1 epoch to lr=3e-3 at 1 epoch isn't really fair if the higher LR converged faster. A more honest comparison: equal-compute (or equal-loss) checkpoints across LRs.
+  </div>
+
+  <h3>Open questions for the next iteration</h3>
+  <ul>
+    <li>At what epoch does each LR start overfitting? (The judge slight regression at <code>lr=3e-4</code> is suggestive.)</li>
+    <li>Does the absolute score ceiling (~6/10) move if we go to SmolLM2-360M or Qwen2.5-0.5B? — testing the "model capacity, not training" hypothesis.</li>
+    <li>Would a third judge protocol (Claude Sonnet, gpt-4o) confirm the convergence story or reveal model-specific judge bias?</li>
+  </ul>
+
+  <p class="small">Artifacts: W&amp;B group <a href="https://wandb.ai/hiremath-sujai1/sft-practice?group=lr-sweep-4ep" target="_blank">lr-sweep-4ep</a> · local <code>results/lr-sweep-4ep/</code> + <code>results/lr-judge-4ep/</code></p>
+</section>
+
+<section id="bugs">
+  <h2>Bugs I hit — debug the next guy</h2>
+  <ol class="bugs">
+    <li><strong>Homebrew awscli's bundled Python lost <code>cryptography</code>.</strong> <code>aws</code> CLI silently broken. Fix: <code>brew reinstall awscli</code>.</li>
+    <li><strong>Spot capacity is per-type.</strong> <code>g4dn.xlarge</code> had zero spot capacity when I launched; <code>g6.xlarge</code> worked. Always have a fallback instance list. Prices via <code>describe-spot-price-history</code> report fine even when capacity is 0 — don't use price availability as a capacity signal.</li>
+    <li><strong>DLAMI "Base" has CUDA but no Python ML stack.</strong> Drivers + nvcc are there; pytorch/conda aren't. Must <code>sudo apt install python3-venv python3-pip</code> and build a venv from scratch.</li>
+    <li><strong>Spot instances can't be stopped, only terminated.</strong> So for AMI creation, use <code>aws ec2 create-image --no-reboot</code>.</li>
+    <li><strong>peft 0.19 requires torch ≥ 2.7</strong> (uses <code>torch.float8_e8m0fnu</code>). The default pytorch <code>cu124</code> index ships torch 2.6. Switch to <code>cu126</code> → torch 2.11 → peft works. Always check transitive dep versions before pinning.</li>
+    <li><strong>TRL 1.x API rewrite.</strong> <code>DataCollatorForCompletionOnlyLM</code> is gone. Replaced by <code>SFTConfig(completion_only_loss=True)</code> + prompt/completion dataset columns. <code>SFTConfig</code> also rejects <code>overwrite_output_dir</code>.</li>
+    <li><strong>SFTTrainer renamed <code>tokenizer</code> → <code>processing_class</code>.</strong></li>
+    <li><strong><code>~</code> expands on the LOCAL shell in <code>ssh remote-cmd</code>.</strong> Use <code>/home/ubuntu/...</code> explicitly for paths on the EC2 side.</li>
+    <li><strong>Fresh EC2 has no S3 IAM role.</strong> <code>aws s3 sync</code> from the instance fails with "Unable to locate credentials". Workaround used: <code>scp</code> results to local, then sync from local.</li>
+  </ol>
+</section>
+
+<section id="careful">
+  <h2>Things to be careful of</h2>
+
+  <div class="warn">
+    <strong>Always run a 50-example smoke test first.</strong> Caught 3 bugs in 90 seconds before spending 15 minutes on the real sweep. Cheap insurance.
+  </div>
+
+  <div class="warn">
+    <strong>Check the <code>trainable_params</code> printout before every run.</strong> Should be 0.1-1% of total for a LoRA config. If it's 100%, LoRA didn't attach (wrong target_modules name, common when porting configs between model families).
+  </div>
+
+  <div class="warn">
+    <strong>Don't pick the winner from loss alone.</strong> Always read 20 generations. Takes 2 minutes. Catches hallucination/tautology failures that training loss is blind to.
+  </div>
+
+  <div class="warn">
+    <strong>EOS handling is silent-failure territory.</strong> If you forget <code>completion = output + tokenizer.eos_token</code> in the format function, the model never learns to stop. It won't crash, it'll just ramble in every eval.
+  </div>
+
+  <div class="warn">
+    <strong>LoRA tolerates ~30× higher LR than full FT.</strong> <code>lr=3e-3</code> didn't diverge here — full fine-tuning at that rate would NaN immediately. When reading other people's LR choices, check if they're LoRA or FT before copying.
+  </div>
+
+  <div class="warn">
+    <strong>Don't use <code>/prepare-env</code> blindly for TRL 1.x.</strong> The version pinning matters. Build AMI manually, capture working versions, save snapshot (<code>ami-0c4c93517bd496890</code>), reuse.
+  </div>
+</section>
+
+<section id="next">
+  <h2>Interesting next experiments</h2>
+
+  <p>Ranked by what I think teaches me the most per hour of compute:</p>
+
+  <ol class="next">
+    <li>
+      <strong>Seed variability at the best configs.</strong>
+      Run <code>lr=1e-3, r=32</code> and <code>lr=1e-3, r=64</code> with seeds {42, 43, 44}. Is the quality difference between them real or noise? Every ranking from a single-seed sweep is a point estimate.
+    </li>
+    <li>
+      <strong>Epochs sweep — done.</strong>
+      Re-ran the original 4-LR sweep at 4 epochs (see <a href="#ep4">4 Epochs section</a>). Surprise: loss kept dropping for every LR (no plateau), and the quality gap between LRs collapsed (win-rate spread 0.34 → 0.08). The 1-epoch sweep was overstating LR sensitivity.
+    </li>
+    <li>
+      <strong>Granular epochs sweep at the best LR.</strong>
+      Fix <code>lr=3e-3</code>, train 8 epochs with checkpoints every 1 epoch, eval each with judge. The slight regression at <code>lr=3e-4</code> from 1ep → 4ep is suggestive of overfitting onset — find the actual sweet spot.
+    </li>
+    <li>
+      <strong>Model-size ablation.</strong>
+      Re-run the LR × rank sweep on SmolLM2-360M and Qwen2.5-0.5B. Does the divergence boundary (r=8 → r=32 at lr=1e-2) shift with model size? Prediction: larger models tolerate lower LR/rank ratios.
+    </li>
+    <li>
+      <strong>Grow the eval set to ~100 prompts.</strong>
+      20 prompts can't distinguish configs whose win-rate gap is &lt;0.1. The middle of the ranking (lr=1e-3 r=4 vs r=8 vs r=64) is all within noise.
+    </li>
+    <li>
+      <strong>Judge-ensemble sanity check.</strong>
+      Re-run with Claude Sonnet as a second judge to verify the ranking is robust to judge choice.
+    </li>
+  </ol>
+
+  <p>After this, Phase 2 is <strong>DPO with a β sweep</strong> — the experiment whose results I actually care about for interviews (Greg's β question at Bespoke). The SFT checkpoint from this sweep (probably <code>lr=1e-3, r=32</code> — judge winner, good loss, not-too-many params) becomes the starting point.</p>
+</section>
+
+<footer>
+  <p>
+    <strong>Artifacts:</strong>
+    W&amp;B <a href="https://wandb.ai/hiremath-sujai1/sft-practice/groups/lr-sweep-v1" target="_blank">lr-sweep-v1</a> ·
+    <a href="https://wandb.ai/hiremath-sujai1/sft-practice/groups/rank-lr-sweep-v1" target="_blank">rank-lr-sweep-v1</a> ·
+    S3 <code>s3://rl-experiments-sujai/experiments/</code> ·
+    Local <code>results/</code>
+  </p>
+  <p>
+    <strong>AMI:</strong> <code>ami-0c4c93517bd496890</code> (sft-practice-env) — reuse for follow-ups.
+  </p>
+  <p class="small">SmolLM2-135M · LoRA · Alpaca 2K · bf16 · seed 42. Code: <code>bec5615</code>.</p>
+</footer>
+
+</main>
+</body>
+</html>
